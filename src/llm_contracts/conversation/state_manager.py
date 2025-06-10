@@ -587,10 +587,10 @@ class ConversationStateManager:
         
         try:
             if hasattr(self.context_manager, 'optimize_context'):
-                optimized = self.context_manager.optimize_context(self.state)
-                if optimized:
+                optimization_record = self.context_manager.optimize_context()
+                if optimization_record and optimization_record.get('final_tokens') is not None:
                     self.validation_metrics["context_compressions"] += 1
-                    logger.debug("Context window optimized")
+                    logger.debug(f"Context window optimized: {optimization_record.get('original_tokens', 0)} -> {optimization_record.get('final_tokens', 0)} tokens")
         except Exception as e:
             logger.error(f"Error managing context window: {e}")
     
@@ -624,9 +624,9 @@ class ConversationStateManager:
                 logger.error(f"Error in violation handler: {e}")
     
     def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count for text (simple approximation)."""
-        # Simple approximation: ~4 characters per token for English
-        return max(1, len(text) // 4)
+        """Estimate token count for text using OpenAI's tiktoken."""
+        from ..utils.tokenizer import count_tokens
+        return count_tokens(text, model="gpt-4")
     
     def __str__(self) -> str:
         return f"ConversationStateManager(id={self.conversation_id}, turns={self.state.turn_count}, phase={self.state.phase.value})"

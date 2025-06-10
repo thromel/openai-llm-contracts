@@ -410,7 +410,15 @@ class ContextOptimizer:
         
         if original_tokens <= max_tokens:
             # No compression needed
-            return elements, {"compression_needed": False, "original_tokens": original_tokens}
+            return elements, {
+                "compression_needed": False, 
+                "original_tokens": original_tokens,
+                "final_tokens": original_tokens,
+                "compression_ratio": 1.0,
+                "elements_removed": 0,
+                "token_utilization": original_tokens / max_tokens,
+                "compression_time_ms": 0.0
+            }
         
         # Select compressor based on strategy
         compressor = self._get_compressor(strategy, elements, max_tokens)

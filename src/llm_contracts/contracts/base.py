@@ -72,29 +72,28 @@ class PromptLengthContract(InputContract):
     def validate(self, data: Any, context: Optional[Dict[str, Any]] = None) -> ValidationResult:
         """Validate that prompt length is within limits."""
         if isinstance(data, str):
-            # Simple token estimation (rough approximation)
-            estimated_tokens = len(data.split()) * 1.3  # Rough estimate
+            # Use tiktoken for accurate token counting
+            from ..utils.tokenizer import count_tokens
+            estimated_tokens = count_tokens(data, model="gpt-4")
             if estimated_tokens <= self.max_tokens:
-                return ValidationResult(True, f"Prompt length OK ({estimated_tokens:.0f} tokens)")
+                return ValidationResult(True, f"Prompt length OK ({estimated_tokens} tokens)")
             else:
                 return ValidationResult(
                     False,
-                    f"Prompt too long: {estimated_tokens:.0f} tokens > {self.max_tokens}",
+                    f"Prompt too long: {estimated_tokens} tokens > {self.max_tokens}",
                     auto_fix_suggestion=f"Truncate prompt to approximately {self.max_tokens} tokens"
                 )
         elif isinstance(data, list):
-            # Handle message format
-            total_tokens = 0
-            for msg in data:
-                if isinstance(msg, dict) and "content" in msg:
-                    total_tokens += len(str(msg["content"]).split()) * 1.3
+            # Handle message format using tiktoken
+            from ..utils.tokenizer import count_tokens_from_messages
+            total_tokens = count_tokens_from_messages(data, model="gpt-4")
 
             if total_tokens <= self.max_tokens:
-                return ValidationResult(True, f"Messages length OK ({total_tokens:.0f} tokens)")
+                return ValidationResult(True, f"Messages length OK ({total_tokens} tokens)")
             else:
                 return ValidationResult(
                     False,
-                    f"Messages too long: {total_tokens:.0f} tokens > {self.max_tokens}",
+                    f"Messages too long: {total_tokens} tokens > {self.max_tokens}",
                     auto_fix_suggestion="Remove older messages or truncate content"
                 )
         elif isinstance(data, dict):
@@ -103,11 +102,20 @@ class PromptLengthContract(InputContract):
                 return self.validate(data["messages"], context)
             else:
                 # Handle other dict formats, estimate from all string values
-                total_content = ""
+                from ..utils.tokenizer import count_tokens
+                total_tokens = 0
                 for key, value in data.items():
                     if isinstance(value, str):
-                        total_content += value + " "
-                return self.validate(total_content.strip(), context)
+                        total_tokens += count_tokens(value, model="gpt-4")
+                
+                if total_tokens <= self.max_tokens:
+                    return ValidationResult(True, f"Content length OK ({total_tokens} tokens)")
+                else:
+                    return ValidationResult(
+                        False,
+                        f"Content too long: {total_tokens} tokens > {self.max_tokens}",
+                        auto_fix_suggestion="Reduce content length"
+                    )
 
         return ValidationResult(False, "Invalid input format for prompt length validation")
 
