@@ -136,5 +136,20 @@ Thumbs.db
 # Project specific
 *.key
 *.pem
+*.secret
 .env.local
 .env.production
+
+# API Keys and secrets (SECURITY)
+openai_key.txt
+api_keys.txt
+sk-*
+*.api_key
+credentials.json
+secrets.json
+
+# Temporary files that might contain keys
+*.tmp
+*.temp
+temp/
+tmp/

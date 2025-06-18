@@ -85,7 +85,11 @@ class PyContractFactory:
         spec = ComplexPyContractParser.parse(constraint)
         
         # Route to appropriate contract type
-        if spec.constraint_type in ['json_schema', 'json_format']:
+        if spec.constraint_type in ['float', 'int', 'str', 'bool']:
+            # Basic parameter validation
+            from pycontract_style_example import ParameterContract
+            return ParameterContract(name, constraint)
+        elif spec.constraint_type in ['json_schema', 'json_format']:
             return PyContractFactory._create_json_contract(name, spec)
         elif spec.constraint_type in ['regex_pattern', 'content_policy']:
             return PyContractFactory._create_security_contract(name, spec)
