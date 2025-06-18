@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Comprehensive test script for PyContract syntax examples from PRODUCTION_EXAMPLES.md
+Validation script for PyContract syntax integration with ImprovedOpenAIProvider
 
-This script tests all the PyContract patterns shown in the production examples
-to ensure they work correctly with ImprovedOpenAIProvider.
+This script validates that all PyContract patterns from PRODUCTION_EXAMPLES.md 
+work correctly. Run this after making changes to verify functionality.
+
+Usage: python3 validate_pycontract_integration.py
+Note: Set OPENAI_API_KEY environment variable for full testing.
 """
 
 import os
