@@ -30,6 +30,8 @@ except ImportError:
     AsyncOpenAI = None
 
 from ..core.exceptions import ProviderError, ContractViolationError
+from ..reliability.circuit_breaker import RobustCircuitBreaker, CircuitBreakerConfig, FailureType
+from ..reliability.retry_mechanism import RobustRetryMechanism, RetryConfig, RetryStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +207,37 @@ class ImprovedOpenAIProvider:
 
         # Performance optimization and reliability components
         self._metrics = ContractMetrics()
+        
+        # Initialize robust circuit breaker
+        circuit_breaker_config = CircuitBreakerConfig(
+            failure_threshold=5,
+            timeout_seconds=60,
+            adaptive_timeout=True,
+            health_check_enabled=True
+        )
+        self._robust_circuit_breaker = RobustCircuitBreaker(
+            name=f"openai_provider_{id(self)}",
+            config=circuit_breaker_config
+        )
+        
+        # Initialize robust retry mechanism
+        retry_config = RetryConfig(
+            max_attempts=3,
+            strategy=RetryStrategy.EXPONENTIAL_BACKOFF,
+            base_delay_ms=1000,
+            max_delay_ms=30000,
+            jitter=True,
+            retryable_exceptions=[
+                'TimeoutError', 'ConnectionError', 'RateLimitError', 
+                'ServiceUnavailableError', 'InternalServerError'
+            ]
+        )
+        self._retry_mechanism = RobustRetryMechanism(
+            config=retry_config,
+            circuit_breaker=self._robust_circuit_breaker
+        )
+        
+        # Legacy circuit breaker for backward compatibility
         self._circuit_breaker = ContractCircuitBreaker()
 
         # Configuration
@@ -255,11 +288,55 @@ class ImprovedOpenAIProvider:
 
     def get_metrics(self) -> Dict[str, Any]:
         """Get current metrics and health report."""
-        return self._metrics.get_health_report()
+        contract_metrics = self._metrics.get_health_report()
+        retry_metrics = self._retry_mechanism.get_metrics()
+        circuit_breaker_status = self._robust_circuit_breaker.get_status()
+        
+        return {
+            "contract_metrics": contract_metrics,
+            "retry_metrics": retry_metrics,
+            "circuit_breaker_status": circuit_breaker_status,
+            "reliability_summary": {
+                "circuit_breaker_state": circuit_breaker_status["state"],
+                "retry_success_rate": retry_metrics.get("success_rate", 1.0),
+                "average_attempts_per_operation": retry_metrics.get("average_attempts_per_operation", 1.0),
+                "total_operations": retry_metrics.get("total_operations", 0)
+            }
+        }
 
     def reset_circuit_breaker(self) -> None:
         """Manually reset the circuit breaker."""
         self._circuit_breaker.record_success()
+        self._robust_circuit_breaker.force_close()
+        logger.info("Circuit breakers have been manually reset")
+    
+    def get_circuit_breaker_status(self) -> Dict[str, Any]:
+        """Get detailed circuit breaker status."""
+        return self._robust_circuit_breaker.get_status()
+    
+    def get_retry_metrics(self) -> Dict[str, Any]:
+        """Get detailed retry metrics."""
+        return self._retry_mechanism.get_metrics()
+    
+    def configure_reliability(self, 
+                            circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+                            retry_config: Optional[RetryConfig] = None) -> None:
+        """Reconfigure reliability settings."""
+        if circuit_breaker_config:
+            # Create new circuit breaker with updated config
+            self._robust_circuit_breaker = RobustCircuitBreaker(
+                name=f"openai_provider_{id(self)}",
+                config=circuit_breaker_config
+            )
+            logger.info("Circuit breaker configuration updated")
+        
+        if retry_config:
+            # Create new retry mechanism with updated config
+            self._retry_mechanism = RobustRetryMechanism(
+                config=retry_config,
+                circuit_breaker=self._robust_circuit_breaker
+            )
+            logger.info("Retry mechanism configuration updated")
 
     def _wrap_chat_namespace(self, chat_attr: Any) -> Any:
         """Wrap only the chat namespace to intercept completions.create."""
@@ -294,123 +371,153 @@ class ImprovedOpenAIProvider:
                 self._original_create = original_completions.create
 
             def create(self, **kwargs: Any) -> Any:
-                """Sync create with contract enforcement."""
-                # Circuit breaker check
-                if self._provider._circuit_breaker.should_skip():
-                    logger.warning(
-                        "Contract validation skipped due to circuit breaker")
-                    return self._original_create(**kwargs)
+                """Sync create with robust retry and circuit breaker."""
+                def _execute_create():
+                    # Circuit breaker check (legacy for contract validation)
+                    if self._provider._circuit_breaker.should_skip():
+                        logger.warning(
+                            "Contract validation skipped due to circuit breaker")
+                        return self._original_create(**kwargs)
 
-                # Sync input validation
-                validation_start = time.time()
+                    # Sync input validation
+                    validation_start = time.time()
+                    try:
+                        self._provider._validate_input_sync(**kwargs)
+                        self._provider._metrics.record_validation_time(
+                            'input', time.time() - validation_start)
+                        self._provider._circuit_breaker.record_success()
+                    except Exception as e:
+                        self._provider._metrics.record_validation_time(
+                            'input', time.time() - validation_start, violated=True)
+                        self._provider._circuit_breaker.record_failure(
+                            'input_validation')
+                        if isinstance(e, ContractViolationError):
+                            raise
+                        logger.warning(f"Input validation error: {e}")
+
+                    # Handle streaming (no retry for streaming)
+                    if kwargs.get('stream', False):
+                        stream = self._original_create(**kwargs)
+                        if self._provider.output_contracts:
+                            # Use the new streaming validation system
+                            from ..streaming import StreamingValidator, StreamWrapper
+                            validator = StreamingValidator(
+                                self._provider.output_contracts,
+                                performance_monitoring=True,
+                                early_termination=True
+                            )
+                            return StreamWrapper(stream, validator)
+                        return stream
+
+                    # Call original OpenAI method
+                    response = self._original_create(**kwargs)
+
+                    # Sync output validation with auto-remediation
+                    validation_start = time.time()
+                    try:
+                        validated_response = self._provider._validate_output_sync(
+                            response, **kwargs)
+                        self._provider._metrics.record_validation_time(
+                            'output', time.time() - validation_start)
+                        self._provider._circuit_breaker.record_success()
+                        return validated_response
+                    except Exception as e:
+                        self._provider._metrics.record_validation_time(
+                            'output', time.time() - validation_start, violated=True)
+                        self._provider._circuit_breaker.record_failure(
+                            'output_validation')
+                        if isinstance(e, ContractViolationError):
+                            raise
+                        logger.warning(f"Output validation error: {e}")
+                        return response
+                
+                # Execute with robust retry mechanism
                 try:
-                    self._provider._validate_input_sync(**kwargs)
-                    self._provider._metrics.record_validation_time(
-                        'input', time.time() - validation_start)
-                    self._provider._circuit_breaker.record_success()
+                    retry_result = self._provider._retry_mechanism.execute_with_retry_sync(_execute_create)
+                    if retry_result.success:
+                        return retry_result.final_result
+                    else:
+                        # Log retry statistics
+                        logger.warning(f"Request failed after {len(retry_result.attempts)} attempts: {retry_result.final_error}")
+                        raise retry_result.final_error
                 except Exception as e:
-                    self._provider._metrics.record_validation_time(
-                        'input', time.time() - validation_start, violated=True)
-                    self._provider._circuit_breaker.record_failure(
-                        'input_validation')
-                    if isinstance(e, ContractViolationError):
-                        raise
-                    logger.warning(f"Input validation error: {e}")
-
-                # Handle streaming
-                if kwargs.get('stream', False):
-                    stream = self._original_create(**kwargs)
-                    if self._provider.output_contracts:
-                        # Use the new streaming validation system
-                        from ..streaming import StreamingValidator, StreamWrapper
-                        validator = StreamingValidator(
-                            self._provider.output_contracts,
-                            performance_monitoring=True,
-                            early_termination=True
-                        )
-                        return StreamWrapper(stream, validator)
-                    return stream
-
-                # Call original OpenAI method
-                response = self._original_create(**kwargs)
-
-                # Sync output validation with auto-remediation
-                validation_start = time.time()
-                try:
-                    validated_response = self._provider._validate_output_sync(
-                        response, **kwargs)
-                    self._provider._metrics.record_validation_time(
-                        'output', time.time() - validation_start)
-                    self._provider._circuit_breaker.record_success()
-                    return validated_response
-                except Exception as e:
-                    self._provider._metrics.record_validation_time(
-                        'output', time.time() - validation_start, violated=True)
-                    self._provider._circuit_breaker.record_failure(
-                        'output_validation')
-                    if isinstance(e, ContractViolationError):
-                        raise
-                    logger.warning(f"Output validation error: {e}")
-                    return response
+                    # Fallback to direct execution if retry mechanism fails
+                    logger.warning(f"Retry mechanism failed, executing directly: {e}")
+                    return _execute_create()
 
             async def acreate(self, **kwargs: Any) -> Any:
-                """Async create with contract enforcement."""
-                # Circuit breaker check
-                if self._provider._circuit_breaker.should_skip():
-                    logger.warning(
-                        "Contract validation skipped due to circuit breaker")
-                    return await self._original_completions.acreate(**kwargs)
+                """Async create with robust retry and circuit breaker."""
+                async def _execute_acreate():
+                    # Circuit breaker check (legacy for contract validation)
+                    if self._provider._circuit_breaker.should_skip():
+                        logger.warning(
+                            "Contract validation skipped due to circuit breaker")
+                        return await self._original_completions.acreate(**kwargs)
 
-                # Async input validation
-                validation_start = time.time()
+                    # Async input validation
+                    validation_start = time.time()
+                    try:
+                        await self._provider._validate_input_async(**kwargs)
+                        self._provider._metrics.record_validation_time(
+                            'input', time.time() - validation_start)
+                        self._provider._circuit_breaker.record_success()
+                    except Exception as e:
+                        self._provider._metrics.record_validation_time(
+                            'input', time.time() - validation_start, violated=True)
+                        self._provider._circuit_breaker.record_failure(
+                            'input_validation')
+                        if isinstance(e, ContractViolationError):
+                            raise
+                        logger.warning(f"Input validation error: {e}")
+
+                    # Handle streaming (no retry for streaming)
+                    if kwargs.get('stream', False):
+                        stream = await self._original_completions.acreate(**kwargs)
+                        if self._provider.output_contracts:
+                            # Use the new streaming validation system
+                            from ..streaming import StreamingValidator, AsyncStreamWrapper
+                            validator = StreamingValidator(
+                                self._provider.output_contracts,
+                                performance_monitoring=True,
+                                early_termination=True
+                            )
+                            return AsyncStreamWrapper(stream, validator)
+                        return stream
+
+                    # Call original OpenAI method
+                    response = await self._original_completions.acreate(**kwargs)
+
+                    # Async output validation with auto-remediation
+                    validation_start = time.time()
+                    try:
+                        validated_response = await self._provider._validate_output_async(response, **kwargs)
+                        self._provider._metrics.record_validation_time(
+                            'output', time.time() - validation_start)
+                        self._provider._circuit_breaker.record_success()
+                        return validated_response
+                    except Exception as e:
+                        self._provider._metrics.record_validation_time(
+                            'output', time.time() - validation_start, violated=True)
+                        self._provider._circuit_breaker.record_failure(
+                            'output_validation')
+                        if isinstance(e, ContractViolationError):
+                            raise
+                        logger.warning(f"Output validation error: {e}")
+                        return response
+                
+                # Execute with robust retry mechanism
                 try:
-                    await self._provider._validate_input_async(**kwargs)
-                    self._provider._metrics.record_validation_time(
-                        'input', time.time() - validation_start)
-                    self._provider._circuit_breaker.record_success()
+                    retry_result = await self._provider._retry_mechanism.execute_with_retry(_execute_acreate)
+                    if retry_result.success:
+                        return retry_result.final_result
+                    else:
+                        # Log retry statistics
+                        logger.warning(f"Request failed after {len(retry_result.attempts)} attempts: {retry_result.final_error}")
+                        raise retry_result.final_error
                 except Exception as e:
-                    self._provider._metrics.record_validation_time(
-                        'input', time.time() - validation_start, violated=True)
-                    self._provider._circuit_breaker.record_failure(
-                        'input_validation')
-                    if isinstance(e, ContractViolationError):
-                        raise
-                    logger.warning(f"Input validation error: {e}")
-
-                # Handle streaming
-                if kwargs.get('stream', False):
-                    stream = await self._original_completions.acreate(**kwargs)
-                    if self._provider.output_contracts:
-                        # Use the new streaming validation system
-                        from ..streaming import StreamingValidator, AsyncStreamWrapper
-                        validator = StreamingValidator(
-                            self._provider.output_contracts,
-                            performance_monitoring=True,
-                            early_termination=True
-                        )
-                        return AsyncStreamWrapper(stream, validator)
-                    return stream
-
-                # Call original OpenAI method
-                response = await self._original_completions.acreate(**kwargs)
-
-                # Async output validation with auto-remediation
-                validation_start = time.time()
-                try:
-                    validated_response = await self._provider._validate_output_async(response, **kwargs)
-                    self._provider._metrics.record_validation_time(
-                        'output', time.time() - validation_start)
-                    self._provider._circuit_breaker.record_success()
-                    return validated_response
-                except Exception as e:
-                    self._provider._metrics.record_validation_time(
-                        'output', time.time() - validation_start, violated=True)
-                    self._provider._circuit_breaker.record_failure(
-                        'output_validation')
-                    if isinstance(e, ContractViolationError):
-                        raise
-                    logger.warning(f"Output validation error: {e}")
-                    return response
+                    # Fallback to direct execution if retry mechanism fails
+                    logger.warning(f"Retry mechanism failed, executing directly: {e}")
+                    return await _execute_acreate()
 
             def __getattr__(self, name: str) -> Any:
                 """Forward all other completion methods unchanged."""

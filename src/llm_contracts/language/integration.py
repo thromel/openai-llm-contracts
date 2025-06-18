@@ -4,9 +4,10 @@ from typing import Optional, Dict, Any, Union, List
 from functools import wraps
 import asyncio
 
-from llm_contracts.language import LLMCLRuntime, LLMCLCompiler
-from llm_contracts.contracts.base import ContractBase
-from llm_contracts.providers.openai_provider import ImprovedOpenAIProvider
+from .runtime import LLMCLRuntime
+from .compiler import LLMCLCompiler
+from ..contracts.base import ContractBase
+from ..providers.openai_provider import ImprovedOpenAIProvider
 
 
 def llmcl_to_contract(llmcl_source: str) -> ContractBase:
