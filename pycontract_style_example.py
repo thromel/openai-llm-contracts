@@ -69,13 +69,13 @@ class ParameterContract(InputContract):
                 return ValidationResult(
                     False,
                     f"{self.param_name} must be >= {self.min_val}, got {value}",
-                    auto_fix_suggestion=f"Use {self.param_name}={self.min_val}"
+                    auto_fix_suggestion={self.param_name: self.min_val}
                 )
             if self.max_val is not None and value > self.max_val:
                 return ValidationResult(
                     False,
                     f"{self.param_name} must be <= {self.max_val}, got {value}",
-                    auto_fix_suggestion=f"Use {self.param_name}={self.max_val}"
+                    auto_fix_suggestion={self.param_name: self.max_val}
                 )
         
         return ValidationResult(True, f"{self.param_name} validation passed")

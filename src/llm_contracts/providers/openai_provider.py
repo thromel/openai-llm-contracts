@@ -599,8 +599,11 @@ class ImprovedOpenAIProvider:
                 result = None
                 # Different contracts may have different validation methods
                 if hasattr(contract, 'validate'):
-                    # Try validating with message dict first (for prompt length contracts)
-                    if 'messages' in kwargs:
+                    # For parameter contracts, pass the full kwargs
+                    # For prompt/message contracts, pass the message dict
+                    if hasattr(contract, 'param_name'):  # This indicates it's a ParameterContract
+                        result = contract.validate(kwargs)
+                    elif 'messages' in kwargs:
                         result = contract.validate(message_dict)
                     else:
                         result = contract.validate(content_to_validate)
@@ -614,6 +617,7 @@ class ImprovedOpenAIProvider:
                         # Apply auto-fix
                         if isinstance(result.auto_fix_suggestion, dict):
                             kwargs.update(result.auto_fix_suggestion)
+                            logger.info(f"Auto-fixed parameters: {result.auto_fix_suggestion}")
                         self._metrics.record_auto_fix_attempt(
                             contract.name if hasattr(contract, 'name') else 'unknown', True)
                     else:
